@@ -11,7 +11,11 @@ export const MAX_EXTRA_DELAY = 120
 export const LIVE_MS = 10_000
 // The feed's 10-second windows hold a frame every second or so: the pane replays them at this step.
 export const TICK_MS = 2_000
-export const IDLE_MS = 300_000
+// Between matches: asleep until START_LEAD_MS before the next scheduled one (waking at least
+// every SLEEP_MAX_MS to read the schedule again), then every NEAR_MS until it starts.
+export const START_LEAD_MS = 10 * 60_000
+export const NEAR_MS = 30_000
+export const SLEEP_MAX_MS = 6 * 3600_000
 export const ERROR_MS = 60_000
 export const BIG_FIGHT_KILLS = 3
 // Game time with no new kill that ends a fight.
@@ -201,15 +205,19 @@ export function kst(iso: string): string {
   return `${p(d.getUTCMonth() + 1)}/${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`
 }
 
-export function nextEvent(schedule: unknown[], nowMs: number): { label: string; kst: string } | undefined {
+// The next match not started yet; one running late stays next for 3 hours past its time.
+export function nextEvent(schedule: unknown[], nowMs: number): { label: string; kst: string; startMs: number } | undefined {
   const upcoming = schedule
     .filter(isObj)
-    .filter(e => e.state === 'unstarted' && Number.isFinite(Date.parse(str(e.startTime))) && Date.parse(str(e.startTime)) >= nowMs - 3600_000)
+    .filter(e => e.state === 'unstarted' && Number.isFinite(Date.parse(str(e.startTime))) && Date.parse(str(e.startTime)) >= nowMs - 3 * 3600_000)
     .sort((a, b) => Date.parse(str(a.startTime)) - Date.parse(str(b.startTime)))
   const first = upcoming[0]
   if (!first) return undefined
   const info = eventInfo(first)
-  return { label: info.codes.length >= 2 ? info.codes.slice(0, 2).join(' vs ') : info.label, kst: kst(str(first.startTime)) }
+  return {
+    label: info.codes.length >= 2 ? info.codes.slice(0, 2).join(' vs ') : info.label,
+    kst: kst(str(first.startTime)), startMs: Date.parse(str(first.startTime)),
+  }
 }
 
 export function queryTime(nowMs: number, lookbackSeconds: number): string {
@@ -276,8 +284,14 @@ export function errorLine(message: string): string {
   return `⚔ LoL: ${last.replace(/^(오류|error):\s*/i, '').slice(0, 80) || '응답 없음'}`
 }
 
-export function nextInterval(state: PollState | undefined): number {
-  return state === 'idle' ? IDLE_MS : state === 'error' ? ERROR_MS : LIVE_MS
+// How long until the next look for a match: LIVE_MS around a match, ERROR_MS after a failure,
+// and between matches by the schedule (see START_LEAD_MS).
+export function nextInterval(state: PollState | undefined, nowMs = 0, nextStartMs?: number): number {
+  if (state === 'error') return ERROR_MS
+  if (state !== 'idle') return LIVE_MS
+  if (nextStartMs === undefined) return SLEEP_MAX_MS
+  const until = nextStartMs - START_LEAD_MS - nowMs
+  return until <= 0 ? NEAR_MS : Math.min(until, SLEEP_MAX_MS)
 }
 
 const utcTime = (ms: number) => new Date(ms).toISOString().slice(11, 19)

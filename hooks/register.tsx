@@ -27,7 +27,11 @@ const errorAtom = atom({ plugin: 'lol-live', key: 'error' } as const, null)
 let settings: Settings = DEFAULTS
 let last: Snapshot | undefined
 let pollState: PollState | undefined
-let lastFetch = 0
+// When the next look for a match is due; between looks the module sleeps (see plan).
+let nextLookAt = 0
+// The schedule, read at most every SCHEDULE_TTL_MS: the 30-second looks before a match reuse it.
+let scheduleCache: { at: number; events: unknown[] } | undefined
+const SCHEDULE_TTL_MS = 10 * 60_000
 let inflight: Promise<void> | undefined
 // Bumped on every settings change: a snapshot fetched under older settings is dropped.
 let generation = 0
@@ -145,7 +149,8 @@ async function discover($: EngineInterface, now: number): Promise<Found> {
     }
     const waiting = infos[0]
     if (waiting) return { snap: { state: 'waiting', label: waiting.label }, alerts }
-    const next = nextEvent(await schedule($), now)
+    if (!scheduleCache || now - scheduleCache.at >= SCHEDULE_TTL_MS) scheduleCache = { at: now, events: await schedule($) }
+    const next = nextEvent(scheduleCache.events, now)
     return { snap: { state: 'idle', ...(next ? { next } : {}) }, alerts }
   } catch (error) {
     return { error: message(error), alerts }
@@ -311,18 +316,33 @@ async function apply($: EngineInterface, now: number, started: number, snap: Sna
   await deliver($, alerts)
 }
 
-// Every TICK_MS: look for the game to show when that is due (LIVE_MS while live or replaying,
-// IDLE_MS between matches, ERROR_MS after a failure), and play the frame for this moment.
+// When to look for a match again, from what the last look found.
+function lookEvery(now: number): number {
+  // A series that just left getLive is confirmed over at LIVE_MS, not after a sleep.
+  if (pollState === 'idle' && series.size > 0) return LIVE_MS
+  return nextInterval(pollState, now, last?.state === 'idle' ? last.next?.startMs : undefined)
+}
+
+// The one timer: TICK_MS while a game is shown (live or replayed), else straight to the next
+// look, so between matches nothing runs until shortly before the next one.
+function plan($: EngineInterface, now: number) {
+  ticker?.cancel()
+  ticker = undefined
+  if (!settings.enabled) return
+  const wait = feed ? TICK_MS : Math.max(TICK_MS, nextLookAt - now)
+  ticker = $.clock.after(wait, () => void tick($))
+}
+
+// Look for the game to show when that is due, and play the frame for this moment.
 async function tick($: EngineInterface, force = false) {
   if (!settings.enabled || inflight) return
   const now = await $.clock.now()
-  const due = force || now - lastFetch >= nextInterval(pollState) - 500
-  if (!due && !feed) return
+  const due = force || now >= nextLookAt - 500
+  if (!due && !feed) return plan($, now)
   const started = generation
   inflight = (async () => {
     let alerts: Alert[] = []
     if (due) {
-      lastFetch = now
       const found = await discover($, now)
       if (started !== generation) return
       alerts = found.alerts
@@ -341,6 +361,8 @@ async function tick($: EngineInterface, force = false) {
     inflight = undefined
   })
   await inflight
+  if (due) nextLookAt = now + lookEvery(now)
+  plan($, now)
 }
 
 async function save($: EngineInterface, next: Settings) {
@@ -360,6 +382,7 @@ async function save($: EngineInterface, next: Settings) {
     await update($, logAtom, () => [])
   }
   if (!settings.enabled) {
+    plan($, 0)
     setStatus($, undefined)
     if ((await $.ui.panes()).some(p => p.id === PANE)) await $.ui.close({ id: PANE })
     return
@@ -395,8 +418,6 @@ export const register: Register = on => {
       argumentHint: '[panel|on|off|alerts|status|list|game|delay|demo [분]|help|질문]',
       immediate: true,
     })
-    ticker?.cancel()
-    ticker = $.clock.every(TICK_MS, () => void tick($))
     void tick($, true)
     return started
   })

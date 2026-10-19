@@ -32,7 +32,7 @@ export type Snapshot =
   | LiveSnapshot
   | { state: 'buffering'; label?: string; gameId: string }
   | { state: 'waiting'; label: string }
-  | { state: 'idle'; next?: { label: string; kst: string } }
+  | { state: 'idle'; next?: { label: string; kst: string; startMs?: number } }
 
 declare module 'claude-code' {
   interface PluginState {

@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 import {
-  DEFAULTS, DEMO, IDLE_MS, LIVE_MS, TICK_MS, applyAction, closeFight, eventInfo, errorLine, gameClock, loadSettings, nextEvent,
+  DEFAULTS, DEMO, ERROR_MS, LIVE_MS, NEAR_MS, SLEEP_MAX_MS, START_LEAD_MS, TICK_MS, applyAction, closeFight, eventInfo, errorLine, gameClock, loadSettings, nextEvent,
   nextInterval, parseCommand, queryTime, snapshotFromWindow, statusLine, step, subject,
 } from './lol'
 import type { LiveSnapshot } from './lol'
@@ -203,10 +203,19 @@ test('idle: next match in KST without results; intervals; errors', async () => {
     { state: 'completed', startTime: '2026-10-18T18:00:00Z', match: { teams: [{ code: 'KC' }, { code: 'MVK' }] } },
     { state: 'unstarted', startTime: '2026-10-23T17:00:00Z', match: { teams: [{ code: 'GEN' }, { code: 'IG' }] } },
   ]
-  expect(nextEvent(schedule, Date.parse('2026-10-19T00:00:00Z'))).toEqual({ label: 'GEN vs IG', kst: '10/24 02:00' })
+  const start = Date.parse('2026-10-23T17:00:00Z')
+  expect(nextEvent(schedule, Date.parse('2026-10-19T00:00:00Z'))).toEqual({ label: 'GEN vs IG', kst: '10/24 02:00', startMs: start })
+  // A match running late is still next for 3 hours.
+  expect(nextEvent(schedule, start + 2 * 3600_000)?.label).toBe('GEN vs IG')
+  expect(nextEvent(schedule, start + 4 * 3600_000)).toBe(undefined)
   expect(nextInterval('live')).toBe(LIVE_MS)
-  expect(nextInterval('idle')).toBe(IDLE_MS)
-  expect(nextInterval('error')).toBe(60_000)
+  expect(nextInterval('error')).toBe(ERROR_MS)
+  // Between matches: asleep until 10 minutes before (6 hours at most), then every 30 s.
+  expect(nextInterval('idle', start - 24 * 3600_000, start)).toBe(SLEEP_MAX_MS)
+  expect(nextInterval('idle', start - 3600_000, start)).toBe(3600_000 - START_LEAD_MS)
+  expect(nextInterval('idle', start - 5 * 60_000, start)).toBe(NEAR_MS)
+  expect(nextInterval('idle', start + 20 * 60_000, start)).toBe(NEAR_MS)
+  expect(nextInterval('idle', start)).toBe(SLEEP_MAX_MS)
   expect(errorLine('HTTP 429: API 호출 한도 초과')).toBe('⚔ LoL: HTTP 429: API 호출 한도 초과')
 })
 
@@ -404,8 +413,38 @@ test('set start, set end with the winner, match end — even when the game windo
   await clock.advance(LIVE_MS)
   expect(notes).toEqual(['🏁 LCK · T1 vs GEN 1세트 종료: T1 승리 (T1 1 : GEN 0)', '▶ LCK · T1 vs GEN 2세트 시작'])
   phase = 4
-  await clock.advance(IDLE_MS)
-  expect(notes).toHaveLength(2)
-  await clock.advance(IDLE_MS)
+  // The failed window put the look a minute off; then two looks without the series end it,
+  // ten seconds apart rather than after a sleep.
+  await clock.advance(ERROR_MS + 3 * LIVE_MS)
   expect(notes.slice(2)).toEqual(['🏁 LCK · T1 vs GEN 2세트 종료: T1 승리', '🏆 경기 종료: LCK · T1 vs GEN (T1 2 : GEN 0)'])
+})
+
+test('between matches nothing runs until 10 minutes before the next one, then a look every 30 s', async ($, on) => {
+  const clock = mock.clock(on)
+  await clock.set(T0)
+  mock.store(on)
+  const start = T0 + 2 * 3600_000
+  const looks: number[] = []
+  const ok = (body: unknown) => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } }) as never
+  on('http.fetch', async (_$, e) => {
+    if (e.url.includes('getLive')) looks.push(clock.now() - T0)
+    if (e.url.includes('getLeagues')) return ok({ data: { leagues: [{ id: 'L1', slug: 'lck', name: 'LCK' }] } })
+    if (e.url.includes('getSchedule')) {
+      return ok({ data: { schedule: { events: [{ state: 'unstarted', startTime: new Date(start).toISOString(), match: { teams: [{ code: 'GEN' }, { code: 'IG' }] } }] } } })
+    }
+    return ok({ data: { schedule: { events: [] } } })
+  })
+  const statuses: (string | undefined)[] = []
+  on('ui.status', async (_$, e) => { statuses.push(e.text); return { value: undefined } })
+  on('ui.panes', async () => ({ value: [] }) as never)
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', async () => ({ value: { command: 'lol' } }))
+  await $.session.start(START)
+  await clock.settle()
+  expect(looks).toEqual([0])
+  expect(statuses.at(-1)).toMatch(/^⚔ 다음: GEN vs IG /)
+  await clock.advance(start - START_LEAD_MS - T0 - 1000)
+  expect(looks).toEqual([0])
+  await clock.advance(1000 + 2 * NEAR_MS)
+  expect(looks).toEqual([0, 6_600_000, 6_630_000, 6_660_000])
 })
