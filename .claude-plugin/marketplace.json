@@ -1,0 +1,5 @@
+{
+  "name": "thunderconch",
+  "owner": { "name": "ThunderConch" },
+  "plugins": [{ "name": "lol-live", "source": "./" }]
+}
