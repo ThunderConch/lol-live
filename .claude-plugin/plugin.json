@@ -1,7 +1,7 @@
 {
   "name": "lol-live",
-  "version": "0.2.1",
-  "description": "LCK/Worlds live score: status line, live pane, teamfight alerts and /lol, straight from the LoL Esports API",
+  "version": "0.3.0",
+  "description": "LCK/Worlds live score: status line with game time, a pane replaying the feed every 2 s, kill and teamfight alerts, /lol, and a replay of the 2026 LCK final",
   "types": "./types/index.d.ts",
   "author": {
     "name": "ThunderConch"

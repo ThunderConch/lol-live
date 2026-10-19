@@ -9,16 +9,33 @@ export type { LiveSnapshot, Player, Side, Snapshot }
 export const API_LOOKBACK = 60
 export const MAX_EXTRA_DELAY = 120
 export const LIVE_MS = 10_000
+// The feed's 10-second windows hold a frame every second or so: the pane replays them at this step.
+export const TICK_MS = 2_000
 export const IDLE_MS = 300_000
 export const ERROR_MS = 60_000
 export const BIG_FIGHT_KILLS = 3
+// Game time with no new kill that ends a fight.
+export const FIGHT_GAP_MS = 10_000
 export const LOG_LIMIT = 40
+
+// The demo replays a real game through the same feed: 2026 LCK final, game 4 (GEN blue, HLE red).
+export const DEMO = {
+  matchId: '117030752644841643',
+  gameId: '117030752644841647',
+  gameNumber: 4,
+  label: 'LCK 2026 결승 · GEN vs HLE',
+  teams: { '100205573495116443': 'GEN', '100205573496804586': 'HLE' } as Record<string, string>,
+  // Where `/lol demo on` starts, in minutes from the game's first frame: a fight comes ~40 s in.
+  fromMinute: 19,
+  maxMinute: 60,
+}
 
 export type Settings = {
   enabled: boolean
   alerts: boolean
   delay: number
   demo: boolean
+  demoFrom?: number
   gameId?: string
   matchId?: string
   at?: string
@@ -34,6 +51,7 @@ export function loadSettings(raw: unknown): Settings {
     alerts: s.alerts !== false,
     delay,
     demo: s.demo === true,
+    ...(Number.isInteger(s.demoFrom) && (s.demoFrom as number) >= 0 && (s.demoFrom as number) <= DEMO.maxMinute ? { demoFrom: s.demoFrom } : {}),
     ...(typeof s.gameId === 'string' && s.gameId ? { gameId: s.gameId } : {}),
     ...(typeof s.matchId === 'string' && s.matchId ? { matchId: s.matchId } : {}),
     ...(typeof s.at === 'string' && s.at ? { at: s.at } : {}),
@@ -89,17 +107,19 @@ function side(frameTeam: Obj, meta: Obj, name: string): Side {
 
 export type TeamNames = Record<string, string>
 
-// The latest frame of a live-stats window, or undefined when it has none.
-export function snapshotFromWindow(
-  payload: unknown, teams: TeamNames, nowMs: number, extra: { label?: string; gameNumber?: number; demo?: boolean } = {},
-): Snapshot {
+export type FeedExtra = { label?: string; gameNumber?: number; demo?: boolean; atMs?: number; gameStartMs?: number; lookbackSeconds?: number }
+
+// The frame of a live-stats window at `extra.atMs` (the last one not after it; the latest
+// without it), or a buffering snapshot when the window has no frame.
+export function snapshotFromWindow(payload: unknown, teams: TeamNames, nowMs: number, extra: FeedExtra = {}): Snapshot {
   if (!isObj(payload)) throw new Error('잘못된 피드 응답')
   const gameId = clean(payload.esportsGameId)
   const frames = list(payload.frames)
     .map(f => ({ f, ms: Date.parse(str(f.rfc460Timestamp)) }))
     .filter(x => Number.isFinite(x.ms) && isObj(x.f.blueTeam) && isObj(x.f.redTeam))
     .sort((a, b) => a.ms - b.ms)
-  const latest = frames.at(-1)
+  const atMs = extra.atMs
+  const latest = atMs === undefined ? frames.at(-1) : (frames.filter(x => x.ms <= atMs).at(-1) ?? frames[0])
   if (!latest) return { state: 'buffering', gameId, ...(extra.label ? { label: extra.label } : {}) }
   const meta = isObj(payload.gameMetadata) ? payload.gameMetadata : {}
   const blueMeta = isObj(meta.blueTeamMetadata) ? meta.blueTeamMetadata : {}
@@ -109,6 +129,8 @@ export function snapshotFromWindow(
     demo: extra.demo === true,
     ...(extra.label ? { label: extra.label } : {}),
     ...(extra.gameNumber ? { gameNumber: extra.gameNumber } : {}),
+    ...(extra.gameStartMs !== undefined && extra.gameStartMs <= latest.ms ? { gameStartMs: extra.gameStartMs } : {}),
+    ...(extra.lookbackSeconds !== undefined ? { lookbackSeconds: extra.lookbackSeconds } : {}),
     gameId,
     frameUtc: new Date(latest.ms).toISOString().replace(/\.\d{3}Z$/, 'Z'),
     frameMs: latest.ms,
@@ -194,6 +216,24 @@ export function ago(seconds: number): string {
   return `${Math.floor(seconds / 3600)}시간 전`
 }
 
+// Game time as the feed's clock gives it: time since the game's first frame, pauses included.
+export function gameClock(s: LiveSnapshot): string | undefined {
+  if (s.gameStartMs === undefined) return undefined
+  const total = Math.max(0, Math.floor((s.frameMs - s.gameStartMs) / 1000))
+  const p = (v: number) => String(v).padStart(2, '0')
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), sec = total % 60
+  return h ? `${h}:${p(m)}:${p(sec)}` : `${p(m)}:${p(sec)}`
+}
+
+// Whole five minutes of game time, for the status line.
+export function gameMinutes(s: LiveSnapshot): number | undefined {
+  if (s.gameStartMs === undefined) return undefined
+  return Math.floor(Math.max(0, s.frameMs - s.gameStartMs) / 300_000) * 5
+}
+
+// Data this much older than the lookback asks for means the feed stopped.
+const STALE_SECONDS = 60
+
 export function goldLead(s: LiveSnapshot): string {
   const { blue, red } = s
   if (blue.gold === undefined || red.gold === undefined) return '골드 ?'
@@ -211,14 +251,9 @@ export function statusLine(s: Snapshot): string {
       return `⚔ ${s.label ?? s.gameId} · 버퍼링`
     case 'live': {
       const { blue, red } = s
-      return [
-        `⚔ ${s.demo ? '[데모] ' : ''}${blue.name} ${pair(blue.kills, red.kills)} ${red.name}`,
-        goldLead(s),
-        `포탑 ${pair(blue.towers, red.towers)}`,
-        `용 ${blue.dragons.length}:${red.dragons.length}`,
-        `바론 ${pair(blue.barons, red.barons)}`,
-        ago(s.ageSeconds),
-      ].join(' · ')
+      const minutes = gameMinutes(s)
+      const stale = s.ageSeconds > (s.lookbackSeconds ?? API_LOOKBACK) + STALE_SECONDS ? ` · ⚠ ${ago(s.ageSeconds)} 데이터` : ''
+      return `⚔ ${s.demo ? '[데모] ' : ''}${blue.name} ${pair(blue.kills, red.kills)} ${red.name}${minutes === undefined ? '' : ` (${minutes}분)`}${stale}`
     }
   }
 }
@@ -233,6 +268,8 @@ export function nextInterval(state: PollState | undefined): number {
 }
 
 const utcTime = (ms: number) => new Date(ms).toISOString().slice(11, 19)
+// Log lines are stamped with game time, or the frame's UTC time before the game's start is known.
+const stamp = (s: LiveSnapshot) => gameClock(s) ?? utcTime(s.frameMs)
 
 // ---------- changes between two snapshots, and teamfights ----------
 
@@ -245,6 +282,7 @@ export const SHORT_TTL = 60_000
 
 export type Fight = {
   startMs: number
+  lastKillMs: number
   kills: { blue: number; red: number }
   killers: Record<string, number>
   deaths: string[]
@@ -266,7 +304,7 @@ function deltas(prev: Side, cur: Side) {
 
 const grew = (a?: number, b?: number) => (a !== undefined && b !== undefined && b > a ? b - a : 0)
 
-// What carries from one poll to the next: the open fight and the last side that led by 1k+.
+// What carries from one step to the next: the open fight and the last side that led by 1k+.
 export type Track = { fight?: Fight; leader?: 'blue' | 'red' }
 export type Step = { track: Track; alerts: Alert[]; log: string[] }
 
@@ -277,8 +315,68 @@ function leadSide(s: LiveSnapshot): 'blue' | 'red' | undefined {
   return s.blue.gold > s.red.gold ? 'blue' : 'red'
 }
 
-// One poll: kills open or extend a fight; a poll with no new kill, a frame that does
-// not advance (pause, game over) or another game closes it.
+function mergeCounts(...maps: Record<string, number>[]): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const m of maps) for (const [k, v] of Object.entries(m)) out[k] = (out[k] ?? 0) + v
+  return out
+}
+
+const countNames = (names: string[]) => mergeCounts(...names.map(name => ({ [name]: 1 })))
+
+// One side's players out of a name -> count map, most first.
+function sideOf(cur: LiveSnapshot, counts: Record<string, number>, isBlue: boolean): [string, number][] {
+  const blueNames = new Set(cur.blue.players.map(p => p.name))
+  return Object.entries(counts).filter(([name]) => blueNames.has(name) === isBlue).sort((a, b) => b[1] - a[1])
+}
+
+const times = ([name, n]: [string, number]) => (n > 1 ? `${name} ×${n}` : name)
+
+// The kills one step saw, the moment it sees them: "⚔ GEN Chovy 킬 · HLE Zeka 사망 (6:4)".
+// The counters say who gained a kill and who died, never who killed whom.
+function killLine(cur: LiveSnapshot, newKills: { blue: number; red: number }, killers: Record<string, number>, deaths: string[]): string {
+  const score = `(${pair(cur.blue.kills, cur.red.kills)})`
+  const dead = countNames(deaths)
+  const parts: string[] = []
+  for (const isBlue of [true, false]) {
+    const team = isBlue ? cur.blue.name : cur.red.name
+    const who = sideOf(cur, killers, isBlue)
+    const scored = isBlue ? newKills.blue : newKills.red
+    if (who.length) parts.push(`${team} ${who.map(times).join('·')} 킬`)
+    else if (scored) parts.push(`${team} 킬 +${scored}`)
+  }
+  for (const isBlue of [true, false]) {
+    const who = sideOf(cur, dead, isBlue)
+    if (who.length) parts.push(`${isBlue ? cur.blue.name : cur.red.name} ${who.map(times).join('·')} 사망`)
+  }
+  return `⚔ ${parts.join(' · ')} ${score}`
+}
+
+// A fight of BIG_FIGHT_KILLS or more, once it is over: a short headline for the toast and the
+// OS notification, and the pane's log with one line per side under it.
+export function closeFight(f: Fight | undefined, cur: LiveSnapshot): { alerts: Alert[]; log: string[] } {
+  if (!f || f.kills.blue + f.kills.red < BIG_FIGHT_KILLS) return { alerts: [], log: [] }
+  const { blue, red } = cur
+  const winner = f.kills.blue === f.kills.red ? '' : ` → ${f.kills.blue > f.kills.red ? blue.name : red.name} 승리`
+  const objectives = f.objectives.length ? ` · ${f.objectives.join('·')}` : ''
+  const headline = `💥 한타 ${blue.name} ${f.kills.blue}:${f.kills.red} ${red.name}${winner} (${pair(blue.kills, red.kills)})${objectives}`
+  const dead = countNames(f.deaths)
+  const width = Math.max(blue.name.length, red.name.length)
+  const sideLine = (isBlue: boolean) => {
+    const killers = sideOf(cur, f.killers, isBlue).map(([name, n]) => `${name} ${n}킬`).join('·') || '-'
+    const died = sideOf(cur, dead, isBlue).map(times).join('·') || '-'
+    return `  └ ${(isBlue ? blue.name : red.name).padEnd(width)} 처치 ${killers} │ 사망 ${died}`
+  }
+  return {
+    // Closing totals: the same fight ends on the same score in every session.
+    alerts: [{ level: 'notify', text: headline, key: `${cur.gameId}:fight:${blue.kills}:${red.kills}`, ttlMs: LONG_TTL }],
+    log: [`${stamp(cur)} ${headline}`, sideLine(true), sideLine(false)],
+  }
+}
+
+// One step between two frames: each kill is told as it is seen; kills less than
+// FIGHT_GAP_MS of game time apart make one fight, summed up once it is over. A frame
+// that does not advance (the caller passes one when the feed stalls) or another game
+// closes the fight too.
 export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: Track): Step {
   const alerts: Alert[] = []
   const log: string[] = []
@@ -287,16 +385,14 @@ export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: T
     const leader = leadSide(cur)
     return { track: leader ? { leader } : {}, alerts, log }
   }
-  if (prev.gameId !== cur.gameId) return { track: {}, alerts: fight ? [fightAlert(fight, prev)] : [], log }
+  if (prev.gameId !== cur.gameId) return { track: {}, ...closeFight(fight, prev) }
   if (cur.frameMs <= prev.frameMs) {
-    return { track: { ...(track.leader ? { leader: track.leader } : {}) }, alerts: fight ? [fightAlert(fight, prev)] : [], log }
+    return { track: { ...(track.leader ? { leader: track.leader } : {}) }, ...closeFight(fight, prev) }
   }
-  const at = utcTime(cur.frameMs)
+  const at = stamp(cur)
   const objectives: string[] = []
   for (const key of ['blue', 'red'] as const) {
     const a = prev[key], b = cur[key]
-    const kills = grew(a.kills, b.kills)
-    if (kills) log.push(`${at} ${b.name} 킬 +${kills} (${pair(cur.blue.kills, cur.red.kills)})`)
     const towers = grew(a.towers, b.towers)
     if (towers) {
       log.push(`${at} ${b.name} 포탑 +${towers}`)
@@ -325,17 +421,28 @@ export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: T
   let next = fight
   if (newKills.blue + newKills.red > 0) {
     const blue = deltas(prev.blue, cur.blue), red = deltas(prev.red, cur.red)
-    next = next ?? { startMs: prev.frameMs, kills: { blue: 0, red: 0 }, killers: {}, deaths: [], objectives: [] }
+    const killers = mergeCounts(blue.killers, red.killers)
+    const deaths = [...blue.deaths, ...red.deaths]
+    const line = killLine(cur, newKills, killers, deaths)
+    log.push(`${at} ${line}`)
+    alerts.push({ level: 'toast', text: line, key: `${cur.gameId}:kills:${cur.blue.kills}:${cur.red.kills}`, ttlMs: SHORT_TTL })
+    next = next ?? { startMs: prev.frameMs, lastKillMs: cur.frameMs, kills: { blue: 0, red: 0 }, killers: {}, deaths: [], objectives: [] }
     next = {
       ...next,
+      lastKillMs: cur.frameMs,
       kills: { blue: next.kills.blue + newKills.blue, red: next.kills.red + newKills.red },
-      killers: mergeCounts(next.killers, blue.killers, red.killers),
-      deaths: [...next.deaths, ...blue.deaths, ...red.deaths],
+      killers: mergeCounts(next.killers, killers),
+      deaths: [...next.deaths, ...deaths],
       objectives: [...next.objectives, ...objectives],
     }
   } else if (next) {
-    alerts.push(fightAlert({ ...next, objectives: [...next.objectives, ...objectives] }, cur))
-    next = undefined
+    next = { ...next, objectives: [...next.objectives, ...objectives] }
+    if (cur.frameMs - next.lastKillMs >= FIGHT_GAP_MS) {
+      const closed = closeFight(next, cur)
+      alerts.push(...closed.alerts)
+      log.push(...closed.log)
+      next = undefined
+    }
   }
   let leader = track.leader
   const side = leadSide(cur)
@@ -350,47 +457,6 @@ export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: T
     leader = side
   }
   return { track: { ...(next ? { fight: next } : {}), ...(leader ? { leader } : {}) }, alerts, log }
-}
-
-function mergeCounts(...maps: Record<string, number>[]): Record<string, number> {
-  const out: Record<string, number> = {}
-  for (const m of maps) for (const [k, v] of Object.entries(m)) out[k] = (out[k] ?? 0) + v
-  return out
-}
-
-// "T1 Faker 2킬·Gumayusi 1킬 / GEN Kiin 1킬": each side's players under its own name, most first.
-function bySide(cur: LiveSnapshot, counts: Record<string, number>, label: (name: string, n: number) => string): string {
-  const blueNames = new Set(cur.blue.players.map(p => p.name))
-  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1])
-  const side = (isBlue: boolean, team: string) => {
-    const list = entries.filter(([name]) => blueNames.has(name) === isBlue).map(([name, n]) => label(name, n))
-    return list.length ? `${team} ${list.join('·')}` : ''
-  }
-  return [side(true, cur.blue.name), side(false, cur.red.name)].filter(Boolean).join(' / ')
-}
-
-// Who gained kills and who died, per side. The counters never say who killed whom.
-function fightWho(f: Fight, cur: LiveSnapshot): string[] {
-  const killers = bySide(cur, f.killers, (name, n) => `${name} ${n}킬`)
-  const deaths = bySide(cur, mergeCounts(...f.deaths.map(name => ({ [name]: 1 }))), (name, n) => (n > 1 ? `${name} ×${n}` : name))
-  return [...(killers ? [`처치 ${killers}`] : []), ...(deaths ? [`사망 ${deaths}`] : [])]
-}
-
-export function fightAlert(f: Fight, cur: LiveSnapshot): Alert {
-  const { blue, red } = cur
-  const total = f.kills.blue + f.kills.red
-  const score = `(${pair(blue.kills, red.kills)})`
-  if (total < BIG_FIGHT_KILLS) {
-    const kills = f.kills.blue && f.kills.red ? `${blue.name} ${f.kills.blue}:${f.kills.red} ${red.name}`
-      : `${f.kills.blue ? blue.name : red.name} +${total}`
-    return { level: 'toast', text: [`⚔ 킬 ${kills} ${score}`, ...fightWho(f, cur)].join(' · '),
-             key: `${cur.gameId}:kills:${cur.blue.kills}:${cur.red.kills}`, ttlMs: SHORT_TTL }
-  }
-  const winner = f.kills.blue === f.kills.red ? '' : ` → ${f.kills.blue > f.kills.red ? blue.name : red.name} 승리`
-  const parts = [`💥 한타 ${blue.name} ${f.kills.blue}:${f.kills.red} ${red.name}${winner} ${score}`, ...fightWho(f, cur)]
-  if (f.objectives.length) parts.push(f.objectives.join('·'))
-  // Closing totals: the same fight ends on the same score in every session.
-  return { level: 'notify', text: parts.join(' · '), key: `${cur.gameId}:fight:${blue.kills}:${red.kills}`, ttlMs: LONG_TTL }
 }
 
 // ---------- /lol ----------
@@ -415,7 +481,7 @@ export const HELP = [
   '/lol game auto        진행 중 경기 자동 선택 (기본)',
   '/lol game <게임ID> [경기ID] [--at UTC시각]   특정 세트 고정',
   `/lol delay <0~${MAX_EXTRA_DELAY}>     추가 지연(초), 기본 API 지연 ${API_LOOKBACK}초 위에 더함`,
-  '/lol demo [on|off]    합성 데모 데이터 (인자 없으면 전환)',
+  `/lol demo [on|off|분]  ${DEMO.label} ${DEMO.gameNumber}세트 다시보기 (기본 ${DEMO.fromMinute}분부터, 숫자는 시작 분)`,
   '/lol <질문>           현재 스냅샷을 근거로 Claude에게 질문',
 ].join('\n')
 
@@ -438,13 +504,21 @@ export function parseCommand(args: string, current: Settings = DEFAULTS): Action
   if ((word === 'on' || word === 'off') && bare) {
     return { kind: 'set', patch: { enabled: word === 'on' }, note: `lol-live ${word === 'on' ? '켜짐' : '꺼짐'}` }
   }
+  if (word === 'demo' && rest.length === 1 && /^\d+$/.test(rest[0] ?? '')) {
+    const minute = Number(rest[0])
+    if (minute > DEMO.maxMinute) return { kind: 'error', text: `demo 시작 분은 0~${DEMO.maxMinute}입니다.` }
+    return { kind: 'set', patch: { demo: true, demoFrom: minute }, note: `데모 켜짐 (${minute}분부터)` }
+  }
   if (word === 'demo' || word === 'alerts') {
     const key = word === 'demo' ? 'demo' : 'alerts'
     const on = toggle(rest, current[key])
     if (on !== undefined) {
-      return { kind: 'set', patch: { [key]: on }, note: `${word === 'demo' ? '데모' : '알림'} ${on ? '켜짐' : '꺼짐'}` }
+      return {
+        kind: 'set', patch: { [key]: on }, ...(key === 'demo' ? { clear: ['demoFrom' as const] } : {}),
+        note: `${word === 'demo' ? '데모' : '알림'} ${on ? '켜짐' : '꺼짐'}`,
+      }
     }
-    if (rest.length <= 1) return { kind: 'error', text: `사용법: /lol ${word} [on|off]` }
+    if (rest.length <= 1) return { kind: 'error', text: `사용법: /lol ${word} [on|off]${word === 'demo' ? '|<시작 분>' : ''}` }
   }
   if (word === 'delay' && bare) return { kind: 'error', text: `사용법: /lol delay <0~${MAX_EXTRA_DELAY}>` }
   if (word === 'delay' && rest.length === 1) {
@@ -480,7 +554,7 @@ export function applyAction(s: Settings, action: Extract<Action, { kind: 'set' }
 }
 
 export function describeSettings(s: Settings): string {
-  const target = s.demo ? '데모' : s.gameId ? `게임 ${s.gameId}${s.matchId ? ` / 경기 ${s.matchId}` : ''}` : '자동'
+  const target = s.demo ? `데모 (${DEMO.label} ${DEMO.gameNumber}세트, ${s.demoFrom ?? DEMO.fromMinute}분부터)` : s.gameId ? `게임 ${s.gameId}${s.matchId ? ` / 경기 ${s.matchId}` : ''}` : '자동'
   return [
     `lol-live ${s.enabled ? '켜짐' : '꺼짐'}`,
     `알림 ${s.alerts ? '켜짐' : '꺼짐'}`,
@@ -496,7 +570,7 @@ export function boardText(s: Snapshot, log: readonly string[]): string {
   const row = (p?: Player) => (p ? `${p.name} ${p.champion} ${n(p.k)}/${n(p.d)}/${n(p.a)} CS ${p.cs} ${gold(p.gold)}` : '-')
   const lines = [
     `${s.demo ? '[데모] ' : ''}${s.label ?? `${blue.name} vs ${red.name}`}${s.gameNumber ? ` · ${s.gameNumber}세트` : ''}`,
-    `프레임 ${s.frameUtc} (${ago(s.ageSeconds)}) · ${s.gameState}`,
+    `${gameClock(s) ? `게임 시간 ${gameClock(s)} · ` : ''}프레임 ${s.frameUtc}${s.demo ? '' : ` (${ago(s.ageSeconds)})`} · ${s.gameState}`,
     `${blue.name} ${n(blue.kills)} : ${n(red.kills)} ${red.name} · ${goldLead(s)}`,
     `골드 ${gold(blue.gold)} : ${gold(red.gold)} · 포탑 ${pair(blue.towers, red.towers)} · 억제기 ${pair(blue.inhibitors, red.inhibitors)} · 바론 ${pair(blue.barons, red.barons)}`,
     `드래곤 ${blue.name} [${blue.dragons.map(d => DRAGON_KO[d] ?? d).join(', ')}] · ${red.name} [${red.dragons.map(d => DRAGON_KO[d] ?? d).join(', ')}]`,
@@ -507,46 +581,8 @@ export function boardText(s: Snapshot, log: readonly string[]): string {
     const b = blue.players[i], r = red.players[i]
     lines.push(`${(b ?? r)?.role ?? '?'}  ${row(b)}  |  ${row(r)}`)
   }
-  if (log.length) lines.push('', '최근 기록 (두 표본의 차이)', ...log.slice(-10))
+  if (log.length) lines.push('', '최근 기록 (게임 시간, 두 표본의 차이)', ...log.slice(-12))
   return lines.join('\n')
 }
 
 export const dragonName = (type: string) => DRAGON_KO[type] ?? type
-
-// ---------- clearly synthetic demo feed ----------
-
-export function demoWindow(nowMs: number): unknown {
-  const seconds = Math.floor(nowMs / 1000)
-  const champions = ['Gnar', 'Vi', 'Ahri', 'Jinx', 'Braum', 'Ornn', 'LeeSin', 'Azir', 'Ashe', 'Leona']
-  const roles = ['top', 'jungle', 'mid', 'bottom', 'support']
-  const meta = (sideId: string, offset: number) => ({
-    esportsTeamId: sideId,
-    participantMetadata: roles.map((role, i) => ({
-      participantId: offset + i + 1, summonerName: `Player ${offset + i + 1}`, championId: champions[offset + i], role,
-    })),
-  })
-  const frames = []
-  for (let t = seconds - 20; t <= seconds; t += 10) {
-    const elapsed = t % 3600
-    // A three-kill teamfight every 3 minutes (blue +2 then red +1 a poll later) plus stray kills.
-    const kills = [Math.floor(elapsed / 150) + 2 * Math.floor((elapsed + 20) / 180),
-                   Math.floor(elapsed / 170) + Math.floor((elapsed + 10) / 180)]
-    const team = (offset: number) => {
-      const own = kills[offset ? 1 : 0] ?? 0, other = kills[offset ? 0 : 1] ?? 0
-      return {
-        totalGold: 10_000 + elapsed * (offset ? 20 : 22), totalKills: own,
-        towers: Math.min(11, Math.floor(elapsed / 350)), inhibitors: 0, barons: Math.floor(elapsed / 1800),
-        dragons: ['infernal', 'ocean', 'mountain', 'cloud'].slice(0, Math.floor((elapsed + offset * 60) / 600)),
-        participants: [0, 1, 2, 3, 4].map(i => ({
-          participantId: offset + i + 1, level: Math.min(18, 1 + Math.floor(elapsed / 110)),
-          kills: Math.floor(own / 5) + (i < own % 5 ? 1 : 0), deaths: Math.floor(other / 5) + (i < other % 5 ? 1 : 0),
-          assists: Math.floor(elapsed / 200), creepScore: Math.floor(elapsed / 7), totalGold: 2000 + elapsed * 4,
-        })),
-      }
-    }
-    frames.push({ rfc460Timestamp: new Date(t * 1000).toISOString(), gameState: 'in_game', blueTeam: team(0), redTeam: team(5) })
-  }
-  return { esportsGameId: 'demo', gameMetadata: { blueTeamMetadata: meta('demo-blue', 0), redTeamMetadata: meta('demo-red', 5) }, frames }
-}
-
-export const DEMO_TEAMS: TeamNames = { 'demo-blue': 'DEMO BLUE', 'demo-red': 'DEMO RED' }

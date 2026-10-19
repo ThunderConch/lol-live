@@ -1,13 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import { eventDetails, liveEvents, liveWindow, schedule } from './api'
+import { eventDetails, firstFrameMs, liveEvents, liveWindow, schedule } from './api'
 import {
-  API_LOOKBACK, DEFAULTS, DEMO_TEAMS, HELP, LIVE_MS, LOG_LIMIT, applyAction, ago, boardText, demoWindow,
-  describeSettings, dragonName, errorLine, eventInfo, gold, goldLead, kst, loadSettings, nextEvent, nextInterval,
+  API_LOOKBACK, DEFAULTS, DEMO, HELP, LIVE_MS, LOG_LIMIT, TICK_MS, applyAction, ago, boardText, describeSettings,
+  dragonName, errorLine, eventInfo, gameClock, gold, goldLead, kst, loadSettings, nextEvent, nextInterval,
   parseCommand, queryTime, snapshotFromWindow, statusLine, step,
 } from './lol'
-import type { Alert, EventInfo, LiveSnapshot, PollState, Settings, Side, Snapshot, Track } from './lol'
+import type { Alert, EventInfo, FeedExtra, LiveSnapshot, PollState, Settings, Side, Snapshot, TeamNames, Track } from './lol'
 
 const STORE_KEY = 'settings'
 const SENT_KEY = 'sent-alerts'
@@ -15,6 +15,10 @@ const PANE = 'lol'
 const SERIES_TTL = 30 * 60_000
 // A live series must be missing from getLive this many polls in a row to count as over.
 const MISSES_FOR_END = 2
+// A frame that has not moved for this long (wall time) means the feed stopped: it closes an open fight.
+const STALL_MS = 20_000
+// A live window that ends before the time being shown is asked again at most this often.
+const REFETCH_MS = 3_000
 
 const snapshotAtom = atom({ plugin: 'lol-live', key: 'snapshot' } as const, null)
 const logAtom = atom({ plugin: 'lol-live', key: 'log' } as const, [])
@@ -29,12 +33,27 @@ let inflight: Promise<void> | undefined
 let generation = 0
 let ticker: Timer | undefined
 let prevLive: LiveSnapshot | undefined
+let lastAdvanceAt = 0
 let track: Track = {}
+let lastStatus: string | undefined
+let lastError: string | null = null
 // Series seen live this process, for set start/end and match end.
 const series = new Map<string, EventInfo & { misses: number }>()
 let seriesReady = false
 let dismissedGame: string | undefined
 const pinnedTeams = new Map<string, EventInfo>()
+// Each game's first frame: the zero of its clock.
+const gameStarts = new Map<string, number>()
+// Wall time the demo started at; its game time runs from `demoFrom` minutes on.
+let demoAnchor: number | undefined
+
+// What the pane plays: one game's feed, the 10-second window that holds the time shown,
+// and how that time moves (live: now minus the lookback; pinned --at: fixed; demo: on from
+// where it started). The window is fetched when the time leaves it; the frames inside it
+// are played back every TICK_MS.
+type Source = { gameId: string; teams: TeamNames; extra: FeedExtra; target: (now: number) => number; growing: boolean }
+type Feed = Source & { window?: unknown; windowStart?: string; lastFrameMs?: number; fetchedAt?: number; retryAt?: number }
+let feed: Feed | undefined
 
 function lookback() {
   return API_LOOKBACK + settings.delay
@@ -42,12 +61,35 @@ function lookback() {
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
-// Series alerts are computed before the window fetch and survive its failure.
-type Fetched = { snap?: Snapshot; error?: string; alerts: Alert[] }
+async function gameStart($: EngineInterface, gameId: string): Promise<number | undefined> {
+  const known = gameStarts.get(gameId)
+  if (known !== undefined) return known
+  try {
+    const ms = await firstFrameMs($, gameId)
+    if (ms !== undefined) gameStarts.set(gameId, ms)
+    return ms
+  } catch {
+    // The clock is optional: the next lookup tries again.
+    return undefined
+  }
+}
 
-async function fetchSnapshot($: EngineInterface, now: number): Promise<Fetched> {
+// Series alerts are computed before the game is looked at and survive its failure.
+type Found = { source?: Source; snap?: Snapshot; error?: string; alerts: Alert[] }
+
+async function discover($: EngineInterface, now: number): Promise<Found> {
   if (settings.demo) {
-    return { snap: snapshotFromWindow(demoWindow(now), DEMO_TEAMS, now, { demo: true, label: '데모 (합성 데이터)' }), alerts: [] }
+    const anchor = (demoAnchor ??= now)
+    const from = (settings.demoFrom ?? DEMO.fromMinute) * 60_000
+    const start = await gameStart($, DEMO.gameId)
+    if (start === undefined) return { error: '데모 경기 기록을 받지 못함', alerts: [] }
+    return {
+      source: {
+        gameId: DEMO.gameId, teams: DEMO.teams, growing: false, target: t => start + from + (t - anchor),
+        extra: { demo: true, label: DEMO.label, gameNumber: DEMO.gameNumber, gameStartMs: start, lookbackSeconds: 0 },
+      },
+      alerts: [],
+    }
   }
   if (settings.gameId) {
     try {
@@ -56,8 +98,16 @@ async function fetchSnapshot($: EngineInterface, now: number): Promise<Fetched> 
         info = pinnedTeams.get(settings.matchId) ?? eventInfo(await eventDetails($, settings.matchId))
         pinnedTeams.set(settings.matchId, info)
       }
-      const window = await liveWindow($, settings.gameId, settings.at ?? queryTime(now, lookback()))
-      return { snap: snapshotFromWindow(window, info?.teams ?? {}, now, info ? { label: info.label } : {}), alerts: [] }
+      const at = settings.at
+      const start = await gameStart($, settings.gameId)
+      return {
+        source: {
+          gameId: settings.gameId, teams: info?.teams ?? {}, growing: !at,
+          target: at ? () => Date.parse(at) + 9_999 : t => t - lookback() * 1000,
+          extra: { ...(info ? { label: info.label } : {}), ...(start !== undefined ? { gameStartMs: start } : {}), lookbackSeconds: lookback() },
+        },
+        alerts: [],
+      }
     } catch (error) {
       return { error: message(error), alerts: [] }
     }
@@ -80,9 +130,17 @@ async function fetchSnapshot($: EngineInterface, now: number): Promise<Fetched> 
   try {
     const playing = infos.find(i => i.game)
     if (playing?.game) {
-      const window = await liveWindow($, playing.game.id, queryTime(now, lookback()))
-      const extra = { label: playing.label, ...(playing.game.number ? { gameNumber: playing.game.number } : {}) }
-      return { snap: snapshotFromWindow(window, playing.teams, now, extra), alerts }
+      const start = await gameStart($, playing.game.id)
+      return {
+        source: {
+          gameId: playing.game.id, teams: playing.teams, growing: true, target: t => t - lookback() * 1000,
+          extra: {
+            label: playing.label, ...(playing.game.number ? { gameNumber: playing.game.number } : {}),
+            ...(start !== undefined ? { gameStartMs: start } : {}), lookbackSeconds: lookback(),
+          },
+        },
+        alerts,
+      }
     }
     const waiting = infos[0]
     if (waiting) return { snap: { state: 'waiting', label: waiting.label }, alerts }
@@ -91,6 +149,34 @@ async function fetchSnapshot($: EngineInterface, now: number): Promise<Fetched> 
   } catch (error) {
     return { error: message(error), alerts }
   }
+}
+
+const lastFrameOf = (window: unknown) => {
+  const frames = (window as { frames?: { rfc460Timestamp?: unknown }[] })?.frames ?? []
+  const ms = Date.parse(String(frames.at(-1)?.rfc460Timestamp ?? ''))
+  return Number.isFinite(ms) ? ms : undefined
+}
+
+// The frame for this moment, out of the cached window, fetching the window it lies in when
+// the time moved past the one held (or a live one ran out of frames).
+async function replay($: EngineInterface, f: Feed, now: number): Promise<{ snap?: Snapshot; error?: string }> {
+  const target = f.target(now)
+  const windowStart = queryTime(target, 0)
+  const ranOut = f.growing && f.lastFrameMs !== undefined && target > f.lastFrameMs + 1_500 && now - (f.fetchedAt ?? 0) >= REFETCH_MS
+  let error: string | undefined
+  if ((f.windowStart !== windowStart || ranOut) && now >= (f.retryAt ?? 0)) {
+    try {
+      const window = await liveWindow($, f.gameId, windowStart)
+      Object.assign(f, { window, windowStart, fetchedAt: now, lastFrameMs: lastFrameOf(window), retryAt: 0 })
+    } catch (e) {
+      // Keep playing what is held; try again a poll later.
+      f.retryAt = now + LIVE_MS
+      error = message(e)
+    }
+  }
+  if (f.window === undefined) return error ? { error } : {}
+  const snap = snapshotFromWindow(f.window, f.teams, f.growing ? now : target, { ...f.extra, atMs: target })
+  return { snap, ...(error ? { error } : {}) }
 }
 
 // Only a team whose recorded win count went up, with both sides' counts known before and after.
@@ -185,25 +271,38 @@ async function showPane($: EngineInterface, snap: Snapshot) {
   }
 }
 
-async function pollOnce($: EngineInterface, now: number) {
-  const started = generation
-  const fetched = await fetchSnapshot($, now)
+function setStatus($: EngineInterface, text: string | undefined) {
+  if (text === lastStatus) return
+  lastStatus = text
+  $.ui.status(text)
+}
+
+async function apply($: EngineInterface, now: number, started: number, snap: Snapshot | undefined, error: string | undefined, found: Alert[]) {
   if (!settings.enabled) return
-  let alerts = fetched.alerts
+  let alerts = found
   if (started === generation) {
-    const { snap, error } = fetched
-    pollState = snap ? snap.state : 'error'
-    $.ui.status(snap ? statusLine(snap) : errorLine(error ?? ''))
-    await update($, errorAtom, () => error ?? null)
+    if (snap || error) {
+      pollState = snap ? snap.state : 'error'
+      setStatus($, snap ? statusLine(snap) : errorLine(error ?? ''))
+    }
+    if ((error ?? null) !== lastError) {
+      lastError = error ?? null
+      await update($, errorAtom, () => lastError)
+    }
     if (snap) {
       last = snap
       await update($, snapshotAtom, () => snap)
       if (snap.state === 'live') {
-        const moved = step(prevLive, snap, track)
-        track = moved.track
-        if (!prevLive || prevLive.gameId !== snap.gameId || snap.frameMs > prevLive.frameMs) prevLive = snap
-        if (moved.log.length) await update($, logAtom, log => [...log, ...moved.log].slice(-LOG_LIMIT))
-        alerts = [...alerts, ...moved.alerts]
+        const advanced = !prevLive || prevLive.gameId !== snap.gameId || snap.frameMs > prevLive.frameMs
+        // A frame that stays put for a tick is the replay waiting on the feed; for STALL_MS it is the feed stopping.
+        if (advanced || now - lastAdvanceAt >= STALL_MS) {
+          const moved = step(prevLive, snap, track)
+          track = moved.track
+          if (advanced) prevLive = snap
+          lastAdvanceAt = now
+          if (moved.log.length) await update($, logAtom, log => [...log, ...moved.log].slice(-LOG_LIMIT))
+          alerts = [...alerts, ...moved.alerts]
+        }
       }
       await showPane($, snap)
     }
@@ -211,19 +310,41 @@ async function pollOnce($: EngineInterface, now: number) {
   await deliver($, alerts)
 }
 
-async function poll($: EngineInterface, force = false) {
+// Every TICK_MS: look for the game to show when that is due (LIVE_MS while live or replaying,
+// IDLE_MS between matches, ERROR_MS after a failure), and play the frame for this moment.
+async function tick($: EngineInterface, force = false) {
   if (!settings.enabled || inflight) return
   const now = await $.clock.now()
-  if (!force && now - lastFetch < nextInterval(pollState) - 500) return
-  lastFetch = now
-  inflight = pollOnce($, now).finally(() => {
+  const due = force || now - lastFetch >= nextInterval(pollState) - 500
+  if (!due && !feed) return
+  const started = generation
+  inflight = (async () => {
+    let alerts: Alert[] = []
+    if (due) {
+      lastFetch = now
+      const found = await discover($, now)
+      if (started !== generation) return
+      alerts = found.alerts
+      if (!found.source) {
+        feed = undefined
+        await apply($, now, started, found.snap, found.error, alerts)
+        return
+      }
+      const held = feed
+      feed = held && held.gameId === found.source.gameId ? Object.assign(held, found.source) : { ...found.source }
+    }
+    if (!feed) return
+    const played = await replay($, feed, now)
+    await apply($, now, started, played.snap, played.error, alerts)
+  })().finally(() => {
     inflight = undefined
   })
   await inflight
 }
 
 async function save($: EngineInterface, next: Settings) {
-  const targetChanged = next.demo !== settings.demo || next.gameId !== settings.gameId || next.at !== settings.at
+  const targetChanged = next.demo !== settings.demo || next.demoFrom !== settings.demoFrom ||
+    next.gameId !== settings.gameId || next.at !== settings.at
   settings = next
   generation += 1
   pollState = undefined
@@ -231,17 +352,20 @@ async function save($: EngineInterface, next: Settings) {
   if (targetChanged) {
     prevLive = undefined
     track = {}
+    feed = undefined
+    demoAnchor = undefined
+    lastAdvanceAt = 0
     dismissedGame = undefined
     await update($, logAtom, () => [])
   }
   if (!settings.enabled) {
-    $.ui.status(undefined)
+    setStatus($, undefined)
     if ((await $.ui.panes()).some(p => p.id === PANE)) await $.ui.close({ id: PANE })
     return
   }
-  // Let a poll begun under the old settings finish (its result is dropped), then fetch anew.
+  // Let a tick begun under the old settings finish (its result is dropped), then look anew.
   if (inflight) await inflight
-  await poll($, true)
+  await tick($, true)
 }
 
 type Elements = ReturnType<EngineInterface['ui']['resolve']>
@@ -267,12 +391,12 @@ export const register: Register = on => {
     await $.command.register({
       name: 'lol',
       description: 'LoL 라이브: 상태줄·패널·한타 알림 제어, 전체 스냅샷, 현재 경기 질문',
-      argumentHint: '[panel|on|off|alerts|status|list|game|delay|demo|help|질문]',
+      argumentHint: '[panel|on|off|alerts|status|list|game|delay|demo [분]|help|질문]',
       immediate: true,
     })
     ticker?.cancel()
-    ticker = $.clock.every(LIVE_MS, () => void poll($))
-    void poll($, true)
+    ticker = $.clock.every(TICK_MS, () => void tick($))
+    void tick($, true)
     return started
   })
 
@@ -287,7 +411,6 @@ export const register: Register = on => {
     const snap = await read($, snapshotAtom)
     const log = await read($, logAtom)
     const error = await read($, errorAtom)
-    const now = await $.clock.now()
     if (!snap || snap.state !== 'live') {
       return (
         <Box flexDirection="column">
@@ -297,16 +420,18 @@ export const register: Register = on => {
       )
     }
     const { blue, red } = snap
+    const clock = gameClock(snap)
     const rows = Math.max(4, (e.viewport?.rows ?? 30) - 16)
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
           <Text dimColor wrap="truncate">
-            {snap.demo ? '[데모] ' : ''}{snap.label ?? ''}{snap.gameNumber ? ` · ${snap.gameNumber}세트` : ''} · {ago(Math.max(0, Math.round((now - snap.frameMs) / 1000)))} · 지연 {lookback()}초
+            {snap.demo ? '[데모] ' : ''}{snap.label ?? ''}{snap.gameNumber ? ` · ${snap.gameNumber}세트` : ''} · {snap.demo ? '다시보기' : `${ago(snap.ageSeconds)} · 지연 ${lookback()}초`}
           </Text>
           {error && <Text color="red" wrap="truncate">{errorLine(error)} (마지막 성공 데이터 표시 중)</Text>}
           <Text bold size="title">
             <Text color="blue">{blue.name} {blue.kills ?? '?'}</Text> : <Text color="red">{red.kills ?? '?'} {red.name}</Text>
+            {clock ? <Text dimColor>{`  ⏱ ${clock}`}</Text> : null}
           </Text>
           <Text wrap="truncate">
             {goldLead(snap)} · 포탑 {blue.towers ?? '?'}:{red.towers ?? '?'} · 바론 {blue.barons ?? '?'}:{red.barons ?? '?'} · 억제기 {blue.inhibitors ?? '?'}:{red.inhibitors ?? '?'}
@@ -320,7 +445,7 @@ export const register: Register = on => {
           {sideBlock(elements, red, 'red')}
         </Box>
         <Box flexDirection="column">
-          {log.length === 0 && <Text dimColor>기록 없음 (관측된 변화가 생기면 표시)</Text>}
+          {log.length === 0 && <Text dimColor>기록 없음 (관측된 변화가 생기면 게임 시간과 함께 표시)</Text>}
           {log.slice(-rows).map(line => <Text dimColor wrap="truncate">{line}</Text>)}
         </Box>
         <Box flexDirection="row" gap={1}>
@@ -365,11 +490,11 @@ export const register: Register = on => {
         }
       }
       case 'snapshot': {
-        await poll($, true)
+        await tick($, true)
         return { text: last ? boardText(last, await read($, logAtom)) : '(스냅샷 없음) /lol status로 오류를 확인하세요.' }
       }
       case 'ask': {
-        await poll($, true)
+        await tick($, true)
         if (!last || pollState === 'error') {
           return { text: '스냅샷을 가져오지 못해 질문을 보내지 않았습니다. /lol status로 오류를 확인하세요.' }
         }

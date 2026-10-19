@@ -71,6 +71,16 @@ export async function eventDetails($: EngineInterface, id: string): Promise<unkn
   return event
 }
 
+// The window asked without a starting time opens at the game's first frame (checked on
+// finished games: kills 0, gold 0): the zero of the game clock, pauses included after it.
+export async function firstFrameMs($: EngineInterface, gameId: string): Promise<number | undefined> {
+  const payload = await getJson($, FEED, `window/${encodeURIComponent(gameId)}`, {})
+  if (String((payload as { esportsGameId?: unknown })?.esportsGameId ?? '') !== gameId) return undefined
+  const frames = (payload as { frames?: { rfc460Timestamp?: unknown }[] })?.frames
+  const ms = Date.parse(String(frames?.[0]?.rfc460Timestamp ?? ''))
+  return Number.isFinite(ms) ? ms : undefined
+}
+
 export async function liveWindow($: EngineInterface, gameId: string, startingTime: string): Promise<unknown> {
   const payload = await getJson($, FEED, `window/${encodeURIComponent(gameId)}`, { startingTime })
   if (String((payload as { esportsGameId?: unknown })?.esportsGameId ?? '') !== gameId) {

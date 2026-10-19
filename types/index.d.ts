@@ -18,6 +18,9 @@ export type LiveSnapshot = {
   label?: string
   gameId: string
   gameNumber?: number
+  // The game's first frame (its clock's zero) and how far behind now the feed was asked.
+  gameStartMs?: number
+  lookbackSeconds?: number
   frameUtc: string
   frameMs: number
   ageSeconds: number

@@ -2,8 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 import {
-  DEFAULTS, IDLE_MS, LIVE_MS, applyAction, eventInfo, errorLine, fightAlert, loadSettings, nextEvent, nextInterval, parseCommand, queryTime,
-  snapshotFromWindow, statusLine, step,
+  DEFAULTS, DEMO, IDLE_MS, LIVE_MS, TICK_MS, applyAction, closeFight, eventInfo, errorLine, gameClock, loadSettings, nextEvent,
+  nextInterval, parseCommand, queryTime, snapshotFromWindow, statusLine, step,
 } from './lol'
 import type { LiveSnapshot } from './lol'
 
@@ -41,21 +41,40 @@ test('snapshot: latest frame, team codes, Korean names, status line', async () =
   const s = snap(frame(T0, { kills: 6, gold: 34_100, towers: 1, dragons: [] }, { kills: 2, gold: 30_800, dragons: ['infernal'] }))
   expect(s.blue.name).toBe('T1')
   expect(s.blue.players[2]).toMatchObject({ role: '미드', name: 'Faker', champion: '아리' })
-  expect(statusLine(s)).toBe('⚔ T1 6:2 GEN · 골드 +3.3k T1 · 포탑 1:0 · 용 0:1 · 바론 0:0 · 60초 전')
+  // Score only, until the game's first frame is known; then whole 5 minutes of game time.
+  expect(statusLine(s)).toBe('⚔ T1 6:2 GEN')
+  const f = frame(T0, { kills: 6 }, { kills: 2 })
+  const timed = snapshotFromWindow({ esportsGameId: 'g1', gameMetadata: meta, frames: [f] }, TEAMS, T0 + 60_000,
+                                   { gameStartMs: T0 - (17 * 60 + 5) * 1000, lookbackSeconds: 60 })
+  if (timed.state !== 'live') throw new Error('expected live')
+  expect(statusLine(timed)).toBe('⚔ T1 6:2 GEN (15분)')
+  expect(gameClock(timed)).toBe('17:05')
+  // A feed that stopped says so.
+  const stale = snapshotFromWindow({ esportsGameId: 'g1', gameMetadata: meta, frames: [f] }, TEAMS, T0 + 200_000, { lookbackSeconds: 60 })
+  expect(statusLine(stale)).toBe('⚔ T1 6:2 GEN · ⚠ 3분 전 데이터')
 })
 
-test('a single kill is one small toast', async () => {
+test('the frame shown is the one at the replay time, not the last of the window', async () => {
+  const frames = [0, 1000, 2000, 3000].map(ms => frame(T0 + ms, { kills: ms / 1000 }, { kills: 0 }))
+  const at = snapshotFromWindow({ esportsGameId: 'g1', gameMetadata: meta, frames }, TEAMS, T0, { atMs: T0 + 1500 })
+  if (at.state !== 'live') throw new Error('expected live')
+  expect(at.frameMs).toBe(T0 + 1000)
+  expect(at.blue.kills).toBe(1)
+})
+
+test('a kill is a toast the moment it is seen; a small fight adds no summary', async () => {
   const a = snap(frame(T0, { kills: 0, players: zero() }, { kills: 0, players: zero() }))
   const b = snap(frame(T0 + 10_000, { kills: 1, players: withStats([[0, 0], [0, 0], [1, 0], [0, 0], [0, 0]]) },
                                     { kills: 0, players: withStats([[0, 0], [0, 0], [0, 1], [0, 0], [0, 0]]) }))
   const opened = step(a, b, {})
-  expect(opened.alerts).toEqual([])
+  expect(opened.alerts).toEqual([expect.objectContaining({ level: 'toast', text: '⚔ T1 Faker 킬 · GEN Chovy 사망 (1:0)' })])
+  expect(opened.log).toEqual(['17:20:10 ⚔ T1 Faker 킬 · GEN Chovy 사망 (1:0)'])
   expect(opened.track.fight?.kills).toEqual({ blue: 1, red: 0 })
   const c = snap(frame(T0 + 20_000, { kills: 1, players: withStats([[0, 0], [0, 0], [1, 0], [0, 0], [0, 0]]) },
                                     { kills: 0, players: withStats([[0, 0], [0, 0], [0, 1], [0, 0], [0, 0]]) }))
   const closed = step(b, c, opened.track)
   expect(closed.track.fight).toBe(undefined)
-  expect(closed.alerts).toEqual([expect.objectContaining({ level: 'toast', text: '⚔ 킬 T1 +1 (1:0) · 처치 T1 Faker 1킬 · 사망 GEN Chovy' })])
+  expect(closed.alerts).toEqual([])
 })
 
 test('kills over consecutive polls become one teamfight summary with who killed and who died', async () => {
@@ -69,20 +88,30 @@ test('kills over consecutive polls become one teamfight summary with who killed 
                                     { kills: 2, players: withStats([[2, 1], [0, 2], [0, 2], [0, 2], [0, 0]]) }))
   const s1 = step(a, b, {})
   const s2 = step(b, c, s1.track)
-  expect(s1.alerts).toEqual([])
-  expect(s2.alerts.map(x => x.text)).toEqual(['🟣 T1 내셔 남작 처치'])
+  expect(s1.alerts.map(x => x.text)).toEqual(['⚔ T1 Faker ×2 킬 · GEN Kiin 킬 · T1 Keria 사망 · GEN Canyon·Chovy 사망 (6:2)'])
+  expect(s2.alerts.map(x => x.text)).toEqual(['🟣 T1 내셔 남작 처치', '⚔ T1 Gumayusi 킬 · GEN Ruler 사망 (7:2)'])
+  // Ten seconds of game time with no kill ends the fight: a short headline, the details in the log.
   const s3 = step(c, d, s2.track)
   expect(s3.alerts).toHaveLength(1)
-  expect(s3.alerts[0]).toMatchObject({ level: 'notify', key: 'g1:fight:7:2' })
-  expect(s3.alerts[0]?.text).toBe('💥 한타 T1 3:1 GEN → T1 승리 (7:2) · 처치 T1 Faker 2킬·Gumayusi 1킬 / GEN Kiin 1킬 · 사망 T1 Keria / GEN Canyon·Chovy·Ruler · T1 바론')
+  expect(s3.alerts[0]).toMatchObject({ level: 'notify', key: 'g1:fight:7:2', text: '💥 한타 T1 3:1 GEN → T1 승리 (7:2) · T1 바론' })
+  expect(s3.log).toEqual([
+    '17:20:30 💥 한타 T1 3:1 GEN → T1 승리 (7:2) · T1 바론',
+    '  └ T1  처치 Faker 2킬·Gumayusi 1킬 │ 사망 Keria',
+    '  └ GEN 처치 Kiin 1킬 │ 사망 Canyon·Chovy·Ruler',
+  ])
 })
 
-test('kills and deaths are split by side, every killer with a count, a repeat death as ×n', async () => {
+test('a fight summary splits kills and deaths by side, every killer with a count, a repeat death as ×n', async () => {
   const cur = snap(frame(T0, { kills: 5 }, { kills: 4 }))
-  const small = fightAlert({ startMs: T0, kills: { blue: 1, red: 1 }, killers: { Chovy: 1, Faker: 1 }, deaths: ['Ruler', 'Keria'], objectives: [] }, cur)
-  expect(small.text).toBe('⚔ 킬 T1 1:1 GEN (5:4) · 처치 T1 Faker 1킬 / GEN Chovy 1킬 · 사망 T1 Keria / GEN Ruler')
-  const big = fightAlert({ startMs: T0, kills: { blue: 1, red: 3 }, killers: { Kiin: 1, Chovy: 2, Oner: 1 }, deaths: ['Keria', 'Faker', 'Keria', 'Zeus'], objectives: [] }, cur)
-  expect(big.text).toBe('💥 한타 T1 1:3 GEN → GEN 승리 (5:4) · 처치 T1 Oner 1킬 / GEN Chovy 2킬·Kiin 1킬 · 사망 T1 Keria ×2·Faker·Zeus')
+  const fight = { startMs: T0, lastKillMs: T0, objectives: [] }
+  expect(closeFight({ ...fight, kills: { blue: 1, red: 1 }, killers: { Chovy: 1, Faker: 1 }, deaths: ['Ruler', 'Keria'] }, cur)).toEqual({ alerts: [], log: [] })
+  const big = closeFight({ ...fight, kills: { blue: 1, red: 3 }, killers: { Kiin: 1, Chovy: 2, Oner: 1 }, deaths: ['Keria', 'Faker', 'Keria', 'Zeus'] }, cur)
+  expect(big.alerts.map(a => a.text)).toEqual(['💥 한타 T1 1:3 GEN → GEN 승리 (5:4)'])
+  expect(big.log).toEqual([
+    '17:20:00 💥 한타 T1 1:3 GEN → GEN 승리 (5:4)',
+    '  └ T1  처치 Oner 1킬 │ 사망 Keria ×2·Faker·Zeus',
+    '  └ GEN 처치 Chovy 2킬·Kiin 1킬 │ 사망 -',
+  ])
 })
 
 test('dragon types; a gold lead flip through small leads still alerts once', async () => {
@@ -121,6 +150,12 @@ test('commands parse; toggles; anything else is a question', async () => {
   expect(parseCommand('panel').kind).toBe('panel')
   expect(parseCommand('demo')).toMatchObject({ patch: { demo: true } })
   expect(parseCommand('demo', { ...DEFAULTS, demo: true })).toMatchObject({ patch: { demo: false } })
+  expect(parseCommand('demo 25')).toMatchObject({ kind: 'set', patch: { demo: true, demoFrom: 25 } })
+  expect(parseCommand('demo 99').kind).toBe('error')
+  expect(loadSettings({ demo: true, demoFrom: 25 }).demoFrom).toBe(25)
+  const fromDemo = parseCommand('demo off')
+  if (fromDemo.kind !== 'set') throw new Error('expected set')
+  expect(applyAction({ ...DEFAULTS, demo: true, demoFrom: 25 }, fromDemo)).toEqual(DEFAULTS)
   expect(parseCommand('alerts')).toMatchObject({ patch: { alerts: false } })
   expect(parseCommand('alerts on')).toMatchObject({ patch: { alerts: true } })
   expect(parseCommand('지금 누가 유리해?')).toEqual({ kind: 'ask', question: '지금 누가 유리해?' })
@@ -158,16 +193,57 @@ test('eventInfo reads the real getEventDetails shape', async () => {
   expect(eventInfo(live).game).toEqual({ id: '116299649498303887', number: 3 })
 })
 
-// ----- the mod in the engine -----
+/// ----- the mod in the engine -----
 
 const START = { cwd: '/tmp', surface: 'terminal' as const, isInteractive: true }
 const RUN = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 200 } }
 
+// A stand-in for the demo game's feed, shaped like the real one: the window asked without a
+// starting time opens at the game's first frame, and every other window holds a frame per
+// second for its 10 seconds. A three-kill fight every 3 minutes (blue +2, red +1 ten seconds
+// later) plus stray kills; each team's kills spread over its players in order.
+const GAME0 = Date.parse('2026-09-13T08:19:07Z')
+const DEMO_IDS = Object.keys(DEMO.teams)
+const DEMO_NAMES = ['GEN Kiin', 'GEN Canyon', 'GEN Chovy', 'GEN Ruler', 'GEN Duro', 'HLE Zeus', 'HLE Kanavi', 'HLE Zeka', 'HLE Gumayusi', 'HLE Delight']
 
-test('demo: status line, pane opens by itself, /lol off closes it and stops', async ($, on) => {
+function fakeFrame(ms: number) {
+  const elapsed = Math.floor((ms - GAME0) / 1000)
+  const kills = [Math.floor(elapsed / 150) + 2 * Math.floor((elapsed + 20) / 180),
+                 Math.floor(elapsed / 170) + Math.floor((elapsed + 10) / 180)]
+  const team = (offset: number) => {
+    const own = kills[offset ? 1 : 0] ?? 0, other = kills[offset ? 0 : 1] ?? 0
+    return {
+      totalGold: 10_000 + elapsed * (offset ? 20 : 22), totalKills: own, towers: 0, inhibitors: 0, barons: 0, dragons: [],
+      participants: [0, 1, 2, 3, 4].map(i => ({
+        participantId: offset + i + 1, level: 12, assists: 0, creepScore: 200, totalGold: 8000,
+        kills: Math.floor(own / 5) + (i < own % 5 ? 1 : 0), deaths: Math.floor(other / 5) + (i < other % 5 ? 1 : 0),
+      })),
+    }
+  }
+  return { rfc460Timestamp: new Date(ms).toISOString(), gameState: 'in_game', blueTeam: team(0), redTeam: team(5) }
+}
+
+function fakeDemoFeed(on: Parameters<TestBody>[1], asked: string[] = []) {
+  const meta = (offset: number) => ({
+    esportsTeamId: DEMO_IDS[offset ? 1 : 0],
+    participantMetadata: roles.map((role, i) => ({ participantId: offset + i + 1, summonerName: DEMO_NAMES[offset + i], championId: champs[offset + i], role })),
+  })
+  on('http.fetch', async (_$, e) => {
+    asked.push(e.url)
+    const m = /\/window\/(\d+)(?:\?startingTime=([^&]+))?$/.exec(e.url)
+    if (!m || m[1] !== DEMO.gameId) return { value: { status: 404, ok: false, headers: {}, text: '' } } as never
+    const from = m[2] ? Date.parse(decodeURIComponent(m[2])) : GAME0
+    const frames = Array.from({ length: m[2] ? 10 : 2 }, (_, i) => fakeFrame(from + i * 1000))
+    const body = { esportsGameId: DEMO.gameId, gameMetadata: { blueTeamMetadata: meta(0), redTeamMetadata: meta(5) }, frames }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } } as never
+  })
+}
+
+test('demo: the real final replays; status line is score and 5-minute game time; /lol off stops it', async ($, on) => {
   const clock = mock.clock(on)
   clock.set(T0)
   mock.store(on, { settings: { demo: true } })
+  fakeDemoFeed(on)
   const statuses: (string | undefined)[] = []
   const opened: string[] = []
   const closed: string[] = []
@@ -181,8 +257,11 @@ test('demo: status line, pane opens by itself, /lol off closes it and stops', as
   on('command.register', async () => ({ value: { command: 'lol' } }))
   await $.session.start(START)
   await clock.settle()
-  expect(statuses.at(-1)).toMatch(/^⚔ \[데모\] DEMO BLUE \d+:\d+ DEMO RED · 골드/)
+  // Demo time starts at DEMO.fromMinute (19:00): the status line rounds down to 15분.
+  expect(statuses.at(-1)).toMatch(/^⚔ \[데모\] GEN \d+:\d+ HLE \(15분\)$/)
   expect(opened).toEqual(['lol'])
+  await clock.advance(70_000)
+  expect(statuses.at(-1)).toMatch(/^⚔ \[데모\] GEN \d+:\d+ HLE \(20분\)$/)
   const off = await $.command.run({ command: 'lol', args: 'off', ...RUN })
   expect(off.text).toContain('lol-live 꺼짐')
   expect(statuses.at(-1)).toBe(undefined)
@@ -192,10 +271,36 @@ test('demo: status line, pane opens by itself, /lol off closes it and stops', as
   expect(statuses.length).toBe(count)
 })
 
+test('a kill is told within a tick of its frame, stamped with game time', async ($, on) => {
+  const clock = mock.clock(on)
+  await clock.set(T0)
+  mock.store(on, { settings: { demo: true } })
+  fakeDemoFeed(on)
+  const toasts: string[] = []
+  on('ui.status', async () => ({ value: undefined }))
+  on('ui.panes', async () => ({ value: [] }) as never)
+  on('ui.open', async () => ({ value: { isPlaced: true } }))
+  on('ui.toast', async (_$, e) => { toasts.push(e.text); return { value: undefined } })
+  on('ui.notify', async () => ({ value: { isSent: true, channel: 'terminal_bell' } }) as never)
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  on('command.register', async () => ({ value: { command: 'lol' } }))
+  await $.session.start(START)
+  await clock.settle()
+  // The first kill after 19:00 in the fake feed is HLE's at 19:50 (elapsed 1190 s): 50 s in.
+  await clock.advance(48_000)
+  expect(toasts).toEqual([])
+  await clock.advance(TICK_MS)
+  expect(toasts).toEqual(['⚔ HLE Zeka 킬 · GEN Chovy 사망 (19:13)'])
+  const board = await $.command.run({ command: 'lol', args: '', ...RUN })
+  expect(board.text).toContain('게임 시간 19:5')
+  expect(board.text).toContain('19:50 ⚔ HLE Zeka 킬 · GEN Chovy 사망 (19:13)')
+})
+
 async function runDemo($: Parameters<TestBody>[0], on: Parameters<TestBody>[1], sent: Record<string, number>) {
   const clock = mock.clock(on)
   clock.set(T0)
   mock.store(on, { settings: { demo: true }, 'sent-alerts': sent })
+  fakeDemoFeed(on)
   const notes: string[] = []
   on('ui.status', async () => ({ value: undefined }))
   on('ui.panes', async () => ({ value: [] }) as never)
@@ -209,15 +314,15 @@ async function runDemo($: Parameters<TestBody>[0], on: Parameters<TestBody>[1], 
   return notes.filter(n => n.startsWith('💥'))
 }
 
-test('demo teamfights are summarized as one notification each', async ($, on) => {
+test('demo teamfights are summarized as one short notification each', async ($, on) => {
   const fights = await runDemo($, on, {})
   expect(fights.length).toBeGreaterThan(0)
-  expect(fights[0]).toMatch(/^💥 한타 DEMO BLUE \d+:\d+ DEMO RED .*처치 .* · 사망 /)
+  for (const fight of fights) expect(fight).toMatch(/^💥 한타 GEN \d+:\d+ HLE( → (GEN|HLE) 승리)? \(\d+:\d+\)/)
 })
 
 test('a notification another session already sent is not sent again', async ($, on) => {
   const sent: Record<string, number> = {}
-  for (let b = 0; b < 80; b++) for (let r = 0; r < 80; r++) sent[`demo:fight:${b}:${r}`] = T0 + 3_600_000
+  for (let b = 0; b < 80; b++) for (let r = 0; r < 80; r++) sent[`${DEMO.gameId}:fight:${b}:${r}`] = T0 + 3_600_000
   expect(await runDemo($, on, sent)).toEqual([])
 })
 
