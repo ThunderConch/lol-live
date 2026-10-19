@@ -3,7 +3,7 @@ import type { TestBody } from 'claude-code/testing'
 
 import {
   DEFAULTS, DEMO, IDLE_MS, LIVE_MS, TICK_MS, applyAction, closeFight, eventInfo, errorLine, gameClock, loadSettings, nextEvent,
-  nextInterval, parseCommand, queryTime, snapshotFromWindow, statusLine, step,
+  nextInterval, parseCommand, queryTime, snapshotFromWindow, statusLine, step, subject,
 } from './lol'
 import type { LiveSnapshot } from './lol'
 
@@ -112,6 +112,36 @@ test('a fight summary splits kills and deaths by side, every killer with a count
     '  └ T1  처치 Oner 1킬 │ 사망 Keria ×2·Faker·Zeus',
     '  └ GEN 처치 Chovy 2킬·Kiin 1킬 │ 사망 -',
   ])
+})
+
+test('towers: numbered live, named by lane and tier where the game\u2019s order is known', async () => {
+  const at = (ms: number, blueTowers: number, redTowers: number, inhib = 0) => {
+    const f = frame(T0 + ms, { kills: 0, towers: blueTowers }, { kills: 0, towers: redTowers })
+    f.blueTeam.inhibitors = inhib
+    return snap(f)
+  }
+  // Live: only how many.
+  const live = step(at(0, 0, 0), at(2000, 1, 0), {})
+  expect(live.alerts.map(a => a.text)).toEqual(['🏰 T1 포탑 파괴 (1번째 · 1:0)'])
+  // Known order (what each side lost): T1 took GEN's bot outer, then two at once, then the twins.
+  const buildings = {
+    blue: { towers: ['탑 1차'], inhibitors: [] },
+    red: { towers: ['바텀 1차', '바텀 2차', '바텀 3차', '쌍둥이', '쌍둥이'], inhibitors: ['바텀'] },
+  }
+  expect(step(at(0, 0, 0), at(2000, 1, 0), {}, buildings).alerts.map(a => a.text)).toEqual(['🏰 T1이 GEN 바텀 1차 파괴 (1:0)'])
+  expect(step(at(0, 1, 0), at(2000, 3, 0), {}, buildings).log).toEqual([
+    '17:20:02 🏰 T1이 GEN 바텀 2차 파괴 (2:0)',
+    '17:20:02 🏰 T1이 GEN 바텀 3차 파괴 (3:0)',
+  ])
+  expect(step(at(0, 3, 0), at(2000, 3, 0, 1), {}, buildings).alerts.map(a => a.text)).toEqual(['🏰 T1이 GEN 바텀 억제기 파괴'])
+  expect(step(at(0, 3, 0, 1), at(2000, 5, 0, 1), {}, buildings).alerts.map(a => a.text)).toEqual([
+    '🏰 T1이 GEN 쌍둥이 (1/2) 파괴 (4:0)', '🏰 T1이 GEN 쌍둥이 (2/2) 파괴 (5:0)',
+  ])
+  expect(step(at(0, 0, 0), at(2000, 0, 1), {}, buildings).alerts.map(a => a.text)).toEqual(['🏰 GEN이 T1 탑 1차 파괴 (0:1)'])
+  // Past the known order, back to numbers.
+  expect(step(at(0, 0, 1), at(2000, 0, 2), {}, buildings).alerts.map(a => a.text)).toEqual(['🏰 GEN 포탑 파괴 (2번째 · 0:2)'])
+  expect([subject('GEN'), subject('HLE'), subject('T1'), subject('KT'), subject('젠지'), subject('한화')])
+    .toEqual(['GEN이', 'HLE가', 'T1이', 'KT가', '젠지가', '한화가'])
 })
 
 test('dragon types; a gold lead flip through small leads still alerts once', async () => {

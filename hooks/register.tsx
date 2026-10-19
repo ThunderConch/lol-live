@@ -7,7 +7,7 @@ import {
   dragonName, errorLine, eventInfo, gameClock, gold, goldLead, kst, loadSettings, nextEvent, nextInterval,
   parseCommand, queryTime, snapshotFromWindow, statusLine, step,
 } from './lol'
-import type { Alert, EventInfo, FeedExtra, LiveSnapshot, PollState, Settings, Side, Snapshot, TeamNames, Track } from './lol'
+import type { Alert, Buildings, EventInfo, FeedExtra, LiveSnapshot, PollState, Settings, Side, Snapshot, TeamNames, Track } from './lol'
 
 const STORE_KEY = 'settings'
 const SENT_KEY = 'sent-alerts'
@@ -51,7 +51,8 @@ let demoAnchor: number | undefined
 // and how that time moves (live: now minus the lookback; pinned --at: fixed; demo: on from
 // where it started). The window is fetched when the time leaves it; the frames inside it
 // are played back every TICK_MS.
-type Source = { gameId: string; teams: TeamNames; extra: FeedExtra; target: (now: number) => number; growing: boolean }
+// `buildings`, where the game's timeline is known (the demo), names each tower and inhibitor.
+type Source = { gameId: string; teams: TeamNames; extra: FeedExtra; target: (now: number) => number; growing: boolean; buildings?: Buildings }
 type Feed = Source & { window?: unknown; windowStart?: string; lastFrameMs?: number; fetchedAt?: number; retryAt?: number }
 let feed: Feed | undefined
 
@@ -85,7 +86,7 @@ async function discover($: EngineInterface, now: number): Promise<Found> {
     if (start === undefined) return { error: '데모 경기 기록을 받지 못함', alerts: [] }
     return {
       source: {
-        gameId: DEMO.gameId, teams: DEMO.teams, growing: false, target: t => start + from + (t - anchor),
+        gameId: DEMO.gameId, teams: DEMO.teams, growing: false, target: t => start + from + (t - anchor), buildings: DEMO.buildings,
         extra: { demo: true, label: DEMO.label, gameNumber: DEMO.gameNumber, gameStartMs: start, lookbackSeconds: 0 },
       },
       alerts: [],
@@ -296,7 +297,7 @@ async function apply($: EngineInterface, now: number, started: number, snap: Sna
         const advanced = !prevLive || prevLive.gameId !== snap.gameId || snap.frameMs > prevLive.frameMs
         // A frame that stays put for a tick is the replay waiting on the feed; for STALL_MS it is the feed stopping.
         if (advanced || now - lastAdvanceAt >= STALL_MS) {
-          const moved = step(prevLive, snap, track)
+          const moved = step(prevLive, snap, track, feed?.gameId === snap.gameId ? feed.buildings : undefined)
           track = moved.track
           if (advanced) prevLive = snap
           lastAdvanceAt = now

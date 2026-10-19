@@ -25,10 +25,23 @@ export const DEMO = {
   gameNumber: 4,
   label: 'LCK 2026 결승 · GEN vs HLE',
   teams: { '100205573495116443': 'GEN', '100205573496804586': 'HLE' } as Record<string, string>,
-  // Where `/lol demo on` starts, in minutes from the game's first frame: a fight comes ~40 s in.
+  // Where `/lol demo on` starts, in minutes of game time: a fight comes ~40 s in.
   fromMinute: 19,
   maxMinute: 60,
+  // The buildings each side lost, in order, from the Riot timeline of this game (Leaguepedia
+  // "V5 data:LOLTMNT02_463374/Timeline", BUILDING_KILL events). The feed only counts them.
+  buildings: {
+    blue: { towers: ['탑 1차', '바텀 1차', '미드 1차', '탑 2차'], inhibitors: [] },
+    red: {
+      towers: ['바텀 1차', '미드 1차', '탑 1차', '미드 2차', '미드 3차', '바텀 2차', '바텀 3차', '쌍둥이', '쌍둥이'],
+      inhibitors: ['미드', '바텀'],
+    },
+  } as Buildings,
 }
+
+// What a side lost, in the order it lost them: a tower as lane and tier ('바텀 2차', '쌍둥이'),
+// an inhibitor as its lane. Known only from a game's timeline, after the game.
+export type Buildings = Record<'blue' | 'red', { towers: string[]; inhibitors: string[] }>
 
 export type Settings = {
   enabled: boolean
@@ -268,6 +281,23 @@ export function nextInterval(state: PollState | undefined): number {
 }
 
 const utcTime = (ms: number) => new Date(ms).toISOString().slice(11, 19)
+
+// 이/가 after a name, by how its last letter is read: 'GEN'이, 'HLE'가, 'T1'이, '젠지'가.
+export function subject(name: string): string {
+  const last = name.trim().slice(-1)
+  const code = last.charCodeAt(0)
+  let closed: boolean
+  if (code >= 0xac00 && code <= 0xd7a3) closed = (code - 0xac00) % 28 !== 0
+  else closed = /[lmnrLMNR013678]/.test(last)
+  return `${name}${closed ? '이' : '가'}`
+}
+
+// '쌍둥이' gets which of the two it was.
+function towerName(lost: string[], index: number): string | undefined {
+  const label = lost[index]
+  if (label !== '쌍둥이') return label
+  return `쌍둥이 (${lost.slice(0, index + 1).filter(l => l === '쌍둥이').length}/2)`
+}
 // Log lines are stamped with game time, or the frame's UTC time before the game's start is known.
 const stamp = (s: LiveSnapshot) => gameClock(s) ?? utcTime(s.frameMs)
 
@@ -377,7 +407,7 @@ export function closeFight(f: Fight | undefined, cur: LiveSnapshot): { alerts: A
 // FIGHT_GAP_MS of game time apart make one fight, summed up once it is over. A frame
 // that does not advance (the caller passes one when the feed stalls) or another game
 // closes the fight too.
-export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: Track): Step {
+export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: Track, buildings?: Buildings): Step {
   const alerts: Alert[] = []
   const log: string[] = []
   const fight = track.fight
@@ -393,12 +423,16 @@ export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: T
   const objectives: string[] = []
   for (const key of ['blue', 'red'] as const) {
     const a = prev[key], b = cur[key]
-    const towers = grew(a.towers, b.towers)
-    if (towers) {
-      log.push(`${at} ${b.name} 포탑 +${towers}`)
-      alerts.push({ level: 'toast', text: `🏰 ${b.name} 포탑 파괴 (${pair(cur.blue.towers, cur.red.towers)})`,
-                    key: `${cur.gameId}:tower:${key}:${b.towers}`, ttlMs: LONG_TTL })
-      objectives.push(`${b.name} 포탑`)
+    const other = key === 'blue' ? 'red' : 'blue'
+    const victim = cur[other].name
+    // The k-th tower a side takes is the k-th its opponent lost.
+    for (let k = (a.towers ?? 0) + 1; k <= (grew(a.towers, b.towers) ? b.towers ?? 0 : 0); k++) {
+      const name = buildings && towerName(buildings[other].towers, k - 1)
+      const score = key === 'blue' ? pair(k, cur.red.towers) : pair(cur.blue.towers, k)
+      const text = name ? `🏰 ${subject(b.name)} ${victim} ${name} 파괴 (${score})` : `🏰 ${b.name} 포탑 파괴 (${k}번째 · ${score})`
+      log.push(`${at} ${text}`)
+      alerts.push({ level: 'toast', text, key: `${cur.gameId}:tower:${key}:${k}`, ttlMs: LONG_TTL })
+      objectives.push(name ? `${victim} ${name.replace(/ \(\d\/2\)$/, '')}` : `${b.name} 포탑`)
     }
     for (const type of b.dragons.slice(a.dragons.length)) {
       const label = type === 'elder' ? '장로 드래곤' : `${DRAGON_KO[type] ?? type} 드래곤`
@@ -412,9 +446,11 @@ export function step(prev: LiveSnapshot | undefined, cur: LiveSnapshot, track: T
       alerts.push({ level: 'notify', text: `🟣 ${b.name} 내셔 남작 처치`, key: `${cur.gameId}:baron:${key}:${b.barons}`, ttlMs: LONG_TTL })
       objectives.push(`${b.name} 바론`)
     }
-    if (grew(a.inhibitors, b.inhibitors)) {
-      log.push(`${at} ${b.name} 억제기`)
-      alerts.push({ level: 'toast', text: `${b.name} 억제기 파괴`, key: `${cur.gameId}:inhib:${key}:${b.inhibitors}`, ttlMs: LONG_TTL })
+    for (let k = (a.inhibitors ?? 0) + 1; k <= (grew(a.inhibitors, b.inhibitors) ? b.inhibitors ?? 0 : 0); k++) {
+      const lane = buildings?.[other].inhibitors[k - 1]
+      const text = lane ? `🏰 ${subject(b.name)} ${victim} ${lane} 억제기 파괴` : `🏰 ${b.name} 억제기 파괴 (${k}번째)`
+      log.push(`${at} ${text}`)
+      alerts.push({ level: 'toast', text, key: `${cur.gameId}:inhib:${key}:${k}`, ttlMs: LONG_TTL })
     }
   }
   const newKills = { blue: grew(prev.blue.kills, cur.blue.kills), red: grew(prev.red.kills, cur.red.kills) }

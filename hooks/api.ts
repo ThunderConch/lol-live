@@ -3,7 +3,7 @@
 
 import type { EngineInterface } from 'claude-code'
 
-import { isTargetLeague } from './lol'
+import { isTargetLeague, queryTime } from './lol'
 
 const PERSISTED = 'https://esports-api.lolesports.com/persisted/gw'
 const FEED = 'https://feed.lolesports.com/livestats/v1'
@@ -71,14 +71,25 @@ export async function eventDetails($: EngineInterface, id: string): Promise<unkn
   return event
 }
 
-// The window asked without a starting time opens at the game's first frame (checked on
-// finished games: kills 0, gold 0): the zero of the game clock, pauses included after it.
+type Frame = { rfc460Timestamp?: unknown; blueTeam?: { totalGold?: unknown } }
+const framesOf = (payload: unknown) => (payload as { frames?: Frame[] })?.frames ?? []
+const msOf = (frame?: Frame) => Date.parse(String(frame?.rfc460Timestamp ?? ''))
+const hasGold = (frame: Frame) => typeof frame.blueTeam?.totalGold === 'number' && frame.blueTeam.totalGold > 0
+
+// The game clock's 0:00. The window asked without a starting time opens at the game's first
+// frame (checked on finished games), a few seconds before gold appears with 0:00, often in
+// the next window: on the 2026 LCK final's game 4 gold came 4.6 s after the first frame, and
+// counting from it put each tower within a second of the Riot timeline. Pauses after it
+// still count. Falls back to the first frame when no gold shows within 30 s.
 export async function firstFrameMs($: EngineInterface, gameId: string): Promise<number | undefined> {
   const payload = await getJson($, FEED, `window/${encodeURIComponent(gameId)}`, {})
   if (String((payload as { esportsGameId?: unknown })?.esportsGameId ?? '') !== gameId) return undefined
-  const frames = (payload as { frames?: { rfc460Timestamp?: unknown }[] })?.frames
-  const ms = Date.parse(String(frames?.[0]?.rfc460Timestamp ?? ''))
-  return Number.isFinite(ms) ? ms : undefined
+  const first = msOf(framesOf(payload)[0])
+  if (!Number.isFinite(first)) return undefined
+  let gold = framesOf(payload).find(hasGold)
+  for (let i = 1; !gold && i <= 3; i++) gold = framesOf(await liveWindow($, gameId, queryTime(first + i * 10_000, 0))).find(hasGold)
+  const zero = msOf(gold)
+  return Number.isFinite(zero) ? zero : first
 }
 
 export async function liveWindow($: EngineInterface, gameId: string, startingTime: string): Promise<unknown> {
