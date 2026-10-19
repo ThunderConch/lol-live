@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
 import {
-  DEFAULTS, IDLE_MS, LIVE_MS, applyAction, eventInfo, errorLine, loadSettings, nextEvent, nextInterval, parseCommand, queryTime,
+  DEFAULTS, IDLE_MS, LIVE_MS, applyAction, eventInfo, errorLine, fightAlert, loadSettings, nextEvent, nextInterval, parseCommand, queryTime,
   snapshotFromWindow, statusLine, step,
 } from './lol'
 import type { LiveSnapshot } from './lol'
@@ -55,7 +55,7 @@ test('a single kill is one small toast', async () => {
                                     { kills: 0, players: withStats([[0, 0], [0, 0], [0, 1], [0, 0], [0, 0]]) }))
   const closed = step(b, c, opened.track)
   expect(closed.track.fight).toBe(undefined)
-  expect(closed.alerts).toEqual([expect.objectContaining({ level: 'toast', text: '⚔ 킬 T1 +1 (1:0)' })])
+  expect(closed.alerts).toEqual([expect.objectContaining({ level: 'toast', text: '⚔ 킬 T1 +1 (1:0) · 처치 T1 Faker 1킬 · 사망 GEN Chovy' })])
 })
 
 test('kills over consecutive polls become one teamfight summary with who killed and who died', async () => {
@@ -74,7 +74,15 @@ test('kills over consecutive polls become one teamfight summary with who killed 
   const s3 = step(c, d, s2.track)
   expect(s3.alerts).toHaveLength(1)
   expect(s3.alerts[0]).toMatchObject({ level: 'notify', key: 'g1:fight:7:2' })
-  expect(s3.alerts[0]?.text).toBe('💥 한타 T1 3:1 GEN → T1 승리 (7:2) · 처치 Faker 2·Kiin·Gumayusi · 사망 Keria / Canyon·Chovy·Ruler · T1 바론')
+  expect(s3.alerts[0]?.text).toBe('💥 한타 T1 3:1 GEN → T1 승리 (7:2) · 처치 T1 Faker 2킬·Gumayusi 1킬 / GEN Kiin 1킬 · 사망 T1 Keria / GEN Canyon·Chovy·Ruler · T1 바론')
+})
+
+test('kills and deaths are split by side, every killer with a count, a repeat death as ×n', async () => {
+  const cur = snap(frame(T0, { kills: 5 }, { kills: 4 }))
+  const small = fightAlert({ startMs: T0, kills: { blue: 1, red: 1 }, killers: { Chovy: 1, Faker: 1 }, deaths: ['Ruler', 'Keria'], objectives: [] }, cur)
+  expect(small.text).toBe('⚔ 킬 T1 1:1 GEN (5:4) · 처치 T1 Faker 1킬 / GEN Chovy 1킬 · 사망 T1 Keria / GEN Ruler')
+  const big = fightAlert({ startMs: T0, kills: { blue: 1, red: 3 }, killers: { Kiin: 1, Chovy: 2, Oner: 1 }, deaths: ['Keria', 'Faker', 'Keria', 'Zeus'], objectives: [] }, cur)
+  expect(big.text).toBe('💥 한타 T1 1:3 GEN → GEN 승리 (5:4) · 처치 T1 Oner 1킬 / GEN Chovy 2킬·Kiin 1킬 · 사망 T1 Keria ×2·Faker·Zeus')
 })
 
 test('dragon types; a gold lead flip through small leads still alerts once', async () => {

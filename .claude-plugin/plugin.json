@@ -1,6 +1,6 @@
 {
   "name": "lol-live",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "LCK/Worlds live score: status line, live pane, teamfight alerts and /lol, straight from the LoL Esports API",
   "types": "./types/index.d.ts",
   "author": {

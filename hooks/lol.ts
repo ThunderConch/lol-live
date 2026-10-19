@@ -259,7 +259,7 @@ function deltas(prev: Side, cur: Side) {
     const old = before.get(p.name)
     if (!old) continue
     if (p.k !== undefined && old.k !== undefined && p.k > old.k) killers[p.name] = p.k - old.k
-    if (p.d !== undefined && old.d !== undefined && p.d > old.d) deaths.push(p.name)
+    if (p.d !== undefined && old.d !== undefined) for (let i = old.d; i < p.d; i++) deaths.push(p.name)
   }
   return { killers, deaths }
 }
@@ -358,22 +358,36 @@ function mergeCounts(...maps: Record<string, number>[]): Record<string, number> 
   return out
 }
 
+// "T1 Faker 2킬·Gumayusi 1킬 / GEN Kiin 1킬": each side's players under its own name, most first.
+function bySide(cur: LiveSnapshot, counts: Record<string, number>, label: (name: string, n: number) => string): string {
+  const blueNames = new Set(cur.blue.players.map(p => p.name))
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1])
+  const side = (isBlue: boolean, team: string) => {
+    const list = entries.filter(([name]) => blueNames.has(name) === isBlue).map(([name, n]) => label(name, n))
+    return list.length ? `${team} ${list.join('·')}` : ''
+  }
+  return [side(true, cur.blue.name), side(false, cur.red.name)].filter(Boolean).join(' / ')
+}
+
+// Who gained kills and who died, per side. The counters never say who killed whom.
+function fightWho(f: Fight, cur: LiveSnapshot): string[] {
+  const killers = bySide(cur, f.killers, (name, n) => `${name} ${n}킬`)
+  const deaths = bySide(cur, mergeCounts(...f.deaths.map(name => ({ [name]: 1 }))), (name, n) => (n > 1 ? `${name} ×${n}` : name))
+  return [...(killers ? [`처치 ${killers}`] : []), ...(deaths ? [`사망 ${deaths}`] : [])]
+}
+
 export function fightAlert(f: Fight, cur: LiveSnapshot): Alert {
   const { blue, red } = cur
   const total = f.kills.blue + f.kills.red
   const score = `(${pair(blue.kills, red.kills)})`
   if (total < BIG_FIGHT_KILLS) {
-    const who = f.kills.blue && f.kills.red ? `${blue.name} ${f.kills.blue} · ${red.name} ${f.kills.red}`
+    const kills = f.kills.blue && f.kills.red ? `${blue.name} ${f.kills.blue}:${f.kills.red} ${red.name}`
       : `${f.kills.blue ? blue.name : red.name} +${total}`
-    return { level: 'toast', text: `⚔ 킬 ${who} ${score}`, key: `${cur.gameId}:kills:${cur.blue.kills}:${cur.red.kills}`, ttlMs: SHORT_TTL }
+    return { level: 'toast', text: [`⚔ 킬 ${kills} ${score}`, ...fightWho(f, cur)].join(' · '),
+             key: `${cur.gameId}:kills:${cur.blue.kills}:${cur.red.kills}`, ttlMs: SHORT_TTL }
   }
   const winner = f.kills.blue === f.kills.red ? '' : ` → ${f.kills.blue > f.kills.red ? blue.name : red.name} 승리`
-  const killers = Object.entries(f.killers).sort((a, b) => b[1] - a[1]).map(([k, v]) => (v > 1 ? `${k} ${v}` : k))
-  const blueNames = new Set(blue.players.map(p => p.name))
-  const deadBlue = f.deaths.filter(d => blueNames.has(d)), deadRed = f.deaths.filter(d => !blueNames.has(d))
-  const parts = [`💥 한타 ${blue.name} ${f.kills.blue}:${f.kills.red} ${red.name}${winner} ${score}`]
-  if (killers.length) parts.push(`처치 ${killers.join('·')}`)
-  if (f.deaths.length) parts.push(`사망 ${deadBlue.join('·') || '-'} / ${deadRed.join('·') || '-'}`)
+  const parts = [`💥 한타 ${blue.name} ${f.kills.blue}:${f.kills.red} ${red.name}${winner} ${score}`, ...fightWho(f, cur)]
   if (f.objectives.length) parts.push(f.objectives.join('·'))
   // Closing totals: the same fight ends on the same score in every session.
   return { level: 'notify', text: parts.join(' · '), key: `${cur.gameId}:fight:${blue.kills}:${red.kills}`, ttlMs: LONG_TTL }
